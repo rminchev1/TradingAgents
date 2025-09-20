@@ -1,8 +1,12 @@
 import os
-from fastapi import FastAPI, HTTPException
+import time
+import logging
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
+from fastapi.responses import StreamingResponse
+import json
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -102,6 +106,108 @@ def analyze(req: AnalyzeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    # Use a general-purpose logger; uvicorn.access expects a specific arg tuple
+    logger = logging.getLogger("uvicorn.error")
+    start = time.time()
+    logger.info(f"--> {request.method} {request.url.path}")
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        logger.exception(f"xxx {request.method} {request.url.path} error: {e}")
+        raise
+    finally:
+        duration_ms = int((time.time() - start) * 1000)
+        logger.info(f"<-- {request.method} {request.url.path} {duration_ms}ms")
+    return response
+
+
+@app.get("/")
+def index():
+    return {"ok": True, "msg": "TradingAgents API", "endpoints": ["/healthz", "/api/analyze", "/api/stream-analyze"]}
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
+
+@app.get("/api/stream-analyze")
+def stream_analyze(ticker: str, date: Optional[str] = None,
+                   provider: Optional[str] = None,
+                   deep_model: Optional[str] = None,
+                   quick_model: Optional[str] = None,
+                   backend_url: Optional[str] = None,
+                   online_tools: Optional[bool] = None):
+    req = AnalyzeRequest(
+        ticker=ticker,
+        date=date,
+        provider=provider,
+        deep_model=deep_model,
+        quick_model=quick_model,
+        backend_url=backend_url,
+        online_tools=online_tools,
+    )
+    cfg = build_config(req)
+    ta = TradingAgentsGraph(debug=False, config=cfg)
+
+    init_state = ta.propagator.create_initial_state(ticker, date or "2024-05-10")
+    args = ta.propagator.get_graph_args()
+
+    def gen():
+        try:
+            last_vals: Dict[str, Any] = {}
+            yield f"data: {json.dumps({'type': 'start', 'ticker': ticker, 'date': init_state['trade_date']})}\n\n"
+
+            last_chunk = None
+            # Pylance type mismatch is fine at runtime; graph.stream accepts dict state
+            for chunk in ta.graph.stream(init_state, **args):  # type: ignore
+                last_chunk = chunk
+
+                for key in [
+                    "market_report",
+                    "sentiment_report",
+                    "news_report",
+                    "fundamentals_report",
+                    "investment_plan",
+                    "trader_investment_plan",
+                    "final_trade_decision",
+                ]:
+                    val = chunk.get(key)
+                    if val and val != last_vals.get(key):
+                        last_vals[key] = val
+                        payload = {"type": key, "value": val}
+                        yield f"data: {json.dumps(payload)}\n\n"
+
+                msgs = chunk.get("messages")
+                if msgs and len(msgs) > 0:
+                    last_msg = msgs[-1]
+                    content = None
+                    role = None
+                    try:
+                        content = getattr(last_msg, "content", None)
+                        role = getattr(last_msg, "type", None) or getattr(last_msg, "role", None)
+                        if not content and isinstance(last_msg, (list, tuple)) and len(last_msg) >= 2:
+                            role, content = last_msg[0], last_msg[1]
+                    except Exception:
+                        pass
+                    if content:
+                        payload = {"type": "message", "role": role or "assistant", "content": content}
+                        yield f"data: {json.dumps(payload)}\n\n"
+
+            if last_chunk and last_chunk.get("final_trade_decision"):
+                processed = ta.process_signal(last_chunk["final_trade_decision"]) or ""
+                payload = {
+                    "type": "done",
+                    "decision": last_chunk.get("final_trade_decision", ""),
+                    "decision_processed": processed,
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+
+            yield "event: end\ndata: {}\n\n"
+        except Exception as e:
+            err = {"type": "error", "message": str(e)}
+            yield f"data: {json.dumps(err)}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")

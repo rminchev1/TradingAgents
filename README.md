@@ -35,6 +35,16 @@ curl -s http://127.0.0.1:8000/api/analyze \
   -d '{"ticker":"NVDA","date":"2024-05-10"}' | jq '.decision, .decision_processed'
 ```
 
+#### Streaming (SSE)
+
+Live stream analysis to your terminal (requires a client that supports SSE display like `curl` with verbose):
+
+```zsh
+curl -N "http://127.0.0.1:8000/api/stream-analyze?ticker=NVDA&date=2024-05-10"
+```
+
+In the UI, click the "Stream" button to see incremental agent updates.
+
 ### One-command startup
 
 Use the helper script to start both backend and UI in one go:
