@@ -165,6 +165,16 @@ def stream_analyze(ticker: str, date: Optional[str] = None,
             for chunk in ta.graph.stream(init_state, **args):  # type: ignore
                 last_chunk = chunk
 
+                agent_for_key = {
+                    "market_report": "Market Analyst",
+                    "sentiment_report": "Social Media Analyst",
+                    "news_report": "News Analyst",
+                    "fundamentals_report": "Fundamentals Analyst",
+                    "investment_plan": "Trader",
+                    "trader_investment_plan": "Trader",
+                    "final_trade_decision": "Risk Manager",
+                }
+
                 for key in [
                     "market_report",
                     "sentiment_report",
@@ -177,7 +187,7 @@ def stream_analyze(ticker: str, date: Optional[str] = None,
                     val = chunk.get(key)
                     if val and val != last_vals.get(key):
                         last_vals[key] = val
-                        payload = {"type": key, "value": val}
+                        payload = {"type": key, "value": val, "agent": agent_for_key.get(key)}
                         yield f"data: {json.dumps(payload)}\n\n"
 
                 msgs = chunk.get("messages")
@@ -202,6 +212,7 @@ def stream_analyze(ticker: str, date: Optional[str] = None,
                     "type": "done",
                     "decision": last_chunk.get("final_trade_decision", ""),
                     "decision_processed": processed,
+                    "agent": "Risk Manager",
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
 
