@@ -35,6 +35,21 @@ curl -s http://127.0.0.1:8000/api/analyze \
   -d '{"ticker":"NVDA","date":"2024-05-10"}' | jq '.decision, .decision_processed'
 ```
 
+### One-command startup
+
+Use the helper script to start both backend and UI in one go:
+
+```zsh
+chmod +x scripts/start.sh
+./scripts/start.sh --install                   # first run: installs deps
+
+# subsequent runs (deps already installed)
+./scripts/start.sh                             # backend:8000, frontend:5173
+
+# custom ports
+./scripts/start.sh --backend-port 9000 --frontend-port 3000
+```
+
 <p align="center">
   <img src="assets/TauricResearch.png" style="width: 60%; height: auto;">
 </p>
@@ -146,7 +161,7 @@ pip install -r requirements.txt
 
 You will also need the FinnHub API for financiapl data. All of our code is implemented with the free tier.
 ```bash
-export FINNHUB_API_KEY=d37ckp9r01qskrefkc7gd37ckp9r01qskrefkc80
+export FINNHUB_API_KEY=$YOUR_FINHUB_KEY
 ```
 
 You will need the OpenAI API for all the agents.
