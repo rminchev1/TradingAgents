@@ -1,3 +1,43 @@
+## Web Chat UI
+
+This repo now includes a minimal web chat to request stock analyses from the TradingAgents pipeline.
+### Backend API (FastAPI)
+
+- Endpoint: `POST /api/analyze`
+- Body: `{ "ticker": "NVDA", "date": "2024-05-10" }`
+- Optional overrides: `provider`, `deep_model`, `quick_model`, `backend_url`, `online_tools`
+
+Run locally:
+
+```zsh
+uv pip install -r requirements.txt  # or: pip install -r requirements.txt
+uvicorn server.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Environment keys (auto-detected): `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`. You can also configure `backend_url`.
+
+### Frontend (Vite + React)
+
+Located in `web/`.
+
+```zsh
+cd web
+npm install
+npm run dev
+```
+
+Default dev proxy sends `/api` to `http://127.0.0.1:8000`. To point to a different backend origin, create `web/.env` and set `VITE_API_URL`.
+
+Open the app at the URL printed by Vite (default: http://localhost:5173). Enter a ticker and optional date, then click Ask.
+
+#### Example request
+
+```zsh
+curl -s http://127.0.0.1:8000/api/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{"ticker":"NVDA","date":"2024-05-10"}' | jq '.decision, .decision_processed'
+```
+
 <p align="center">
   <img src="assets/TauricResearch.png" style="width: 60%; height: auto;">
 </p>
@@ -114,9 +154,9 @@ pip install -r requirements.txt
 
 ### Required APIs
 
-You will also need the FinnHub API for financial data. All of our code is implemented with the free tier.
+You will also need the FinnHub API for financiapl data. All of our code is implemented with the free tier.
 ```bash
-export FINNHUB_API_KEY=$YOUR_FINNHUB_API_KEY
+export FINNHUB_API_KEY=d37ckp9r01qskrefkc7gd37ckp9r01qskrefkc80
 ```
 
 You will need the OpenAI API for all the agents.

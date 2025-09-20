@@ -7,3 +7,6 @@ eval_results/
 eval_data/
 *.egg-info/
 .env
+results/
+node_modules/
+dist/
