@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any, List
 from fastapi.responses import StreamingResponse
 import json
 import uuid
+from datetime import date as _date
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -153,7 +154,17 @@ async def log_requests(request: Request, call_next):
 
 @app.get("/")
 def index():
-    return {"ok": True, "msg": "TradingAgents API", "endpoints": ["/healthz", "/api/analyze", "/api/stream-analyze"]}
+    return {
+        "ok": True,
+        "msg": "TradingAgents API",
+        "endpoints": [
+            "/healthz",
+            "/api/analyze",
+            "/api/stream-analyze",
+            "/api/chat",
+            "/api/chat-stream",
+        ],
+    }
 
 
 @app.get("/healthz")
@@ -277,6 +288,230 @@ def _build_quick_llm(cfg: Dict[str, Any]):
         from langchain_google_genai import ChatGoogleGenerativeAI
         return ChatGoogleGenerativeAI(model=cfg["quick_think_llm"])
     raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+
+
+def _extract_intent(cfg: Dict[str, Any], user_text: str, prior: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    llm = _build_quick_llm(cfg)
+    sys = (
+        "You are an assistant that extracts trading request details. "
+        "From the user's message, extract: ticker (uppercase stock symbol), date (YYYY-MM-DD if any), "
+        "period (free text like 'last 6 months' if any), goals (1 short sentence), risk (low|medium|high if implied), "
+        "and confirmProceed (yes|no if they clearly confirmed to run research)."
+        "Respond with ONLY valid compact JSON like {\"ticker\":\"NVDA\",\"date\":\"2024-05-10\",\"period\":\"last year\",\"goals\":\"swing trade\",\"risk\":\"medium\",\"confirmProceed\":\"yes\"}."
+    )
+    messages = [
+        ("system", sys),
+        ("human", user_text),
+    ]
+    extracted: Dict[str, Any] = {}
+    try:
+        resp = llm.invoke(messages)
+        txt = getattr(resp, "content", str(resp))
+        # Try to locate JSON in text
+        start = txt.find("{")
+        end = txt.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            js = txt[start : end + 1]
+            extracted = json.loads(js)
+    except Exception:
+        extracted = {}
+    # Merge with prior
+    out = dict(prior or {})
+    for k, v in extracted.items():
+        if v not in (None, ""):
+            out[k] = v
+    return out
+
+
+def _rep_message(text: str):
+    return f"data: {json.dumps({'type': 'message', 'role': 'assistant', 'agent': 'Fund Representative', 'content': text})}\n\n"
+
+
+@app.get("/api/chat-stream")
+def chat_stream(q: str, conv_id: Optional[str] = None,
+                provider: Optional[str] = None,
+                quick_model: Optional[str] = None,
+                backend_url: Optional[str] = None):
+    # Build a lightweight cfg for quick LLM use (chatting and intent extraction)
+    cfg = DEFAULT_CONFIG.copy()
+    if provider:
+        cfg["llm_provider"] = provider
+    else:
+        detected = detect_provider_from_env()
+        if detected:
+            cfg["llm_provider"] = detected
+    if quick_model:
+        cfg["quick_think_llm"] = quick_model
+    if backend_url:
+        cfg["backend_url"] = backend_url
+
+    # Retrieve or create conversation
+    created_new = False
+    conv: Dict[str, Any]
+    if conv_id and conv_id in Conversations:
+        conv = Conversations[conv_id]
+        # Update cfg if overrides are provided in this call
+        conv["cfg"].update({k: v for k, v in cfg.items() if v is not None})
+    else:
+        conv_id = uuid.uuid4().hex
+        conv = Conversations.setdefault(conv_id, {
+            "cfg": cfg,
+            "ticker": None,
+            "date": None,
+            "reports": {},
+            "history": [{"role": "system", "content": "Fund Representative chat started."}],
+            "intent": {},
+            "phase": "gather",  # gather -> confirm -> executing -> completed
+        })
+        created_new = True
+
+    def gen():
+        # Start event with conv_id
+        yield f"data: {json.dumps({'type': 'start', 'conv_id': conv_id})}\n\n"
+
+        # Record user message
+        user_text = q.strip()
+        Conversations[conv_id]["history"].append({"role": "user", "content": user_text})
+
+        # Extract/merge intent
+        intent = _extract_intent(Conversations[conv_id]["cfg"], user_text, Conversations[conv_id].get("intent"))
+        Conversations[conv_id]["intent"] = intent
+
+        ticker = intent.get("ticker") or intent.get("symbol")
+        # Prefer explicit date; if absent and period exists, we will ask to confirm end date (today)
+        intent_date = intent.get("date")
+        period = intent.get("period")
+        goals = intent.get("goals")
+        risk = intent.get("risk")
+        confirm = (intent.get("confirmProceed") or "").lower() in ("yes", "y", "true") or ("yes" in user_text.lower())
+
+        missing = []
+        if not ticker:
+            missing.append("ticker")
+        if not intent_date and not period:
+            missing.append("date or period")
+        if Conversations[conv_id]["phase"] == "gather":
+            # Ask clarifying questions if anything missing
+            if missing:
+                greet = "Welcome! I'm your Fund Representative. " if created_new else "Thanks! "
+                ask = []
+                if "ticker" in missing:
+                    ask.append("Which stock ticker are you interested in?")
+                if "date or period" in missing:
+                    ask.append("What time horizon or specific date should we focus on?")
+                extra = []
+                if not goals:
+                    extra.append("Briefly, what are your goals (e.g., swing trade, long-term)?")
+                if not risk:
+                    extra.append("Any risk preference (low/medium/high)?")
+                text = greet + " ".join(ask + extra)
+                yield _rep_message(text)
+                yield "event: end\ndata: {}\n\n"
+                return
+
+            # We have ticker and a time reference; prepare a confirmation proposal
+            use_date = intent_date or _date.today().isoformat()
+            Conversations[conv_id]["phase"] = "confirm"
+            Conversations[conv_id]["ticker"] = ticker
+            Conversations[conv_id]["date"] = use_date
+            proposal = (
+                f"Great. I can run a full multi-analyst research cycle for {ticker} "
+                f"using {('period '+period) if period and not intent_date else 'trade date ' + use_date}. "
+                f"Goals: {(goals or 'unspecified')}. Risk: {(risk or 'unspecified')}. "
+                "Shall I proceed now?"
+            )
+            yield _rep_message(proposal)
+            if not confirm:
+                yield "event: end\ndata: {}\n\n"
+                return
+
+        # If we're here, either we're in confirm with a yes, or user said yes now
+        Conversations[conv_id]["phase"] = "executing"
+        ticker = Conversations[conv_id]["ticker"] or ticker
+        run_date = Conversations[conv_id]["date"] or intent_date or _date.today().isoformat()
+        if not ticker:
+            yield _rep_message("I still don't have the stock ticker. Please provide the symbol (e.g., NVDA).")
+            yield "event: end\ndata: {}\n\n"
+            return
+        company = str(ticker)
+        cfg_exec = Conversations[conv_id]["cfg"]
+
+        # Announce execution
+        yield _rep_message(f"Understood. Kicking off research for {ticker} on {run_date}. You'll see updates below.")
+
+        # Execute the graph streaming and forward events
+        try:
+            ta = TradingAgentsGraph(debug=False, config=cfg_exec)
+            init_state = ta.propagator.create_initial_state(company, run_date)
+            args = ta.propagator.get_graph_args()
+
+            last_vals: Dict[str, Any] = {}
+            last_chunk = None
+
+            agent_for_key = {
+                "market_report": "Market Analyst",
+                "sentiment_report": "Social Media Analyst",
+                "news_report": "News Analyst",
+                "fundamentals_report": "Fundamentals Analyst",
+                "investment_plan": "Trader",
+                "trader_investment_plan": "Trader",
+                "final_trade_decision": "Risk Manager",
+            }
+
+            for chunk in ta.graph.stream(init_state, **args):  # type: ignore
+                last_chunk = chunk
+
+                for key in [
+                    "market_report",
+                    "sentiment_report",
+                    "news_report",
+                    "fundamentals_report",
+                    "investment_plan",
+                    "trader_investment_plan",
+                    "final_trade_decision",
+                ]:
+                    val = chunk.get(key)
+                    if val and val != last_vals.get(key):
+                        last_vals[key] = val
+                        Conversations[conv_id]["reports"][key] = val
+                        payload = {"type": key, "value": val, "agent": agent_for_key.get(key)}
+                        yield f"data: {json.dumps(payload)}\n\n"
+
+                msgs = chunk.get("messages")
+                if msgs and len(msgs) > 0:
+                    last_msg = msgs[-1]
+                    content = None
+                    role = None
+                    try:
+                        content = getattr(last_msg, "content", None)
+                        role = getattr(last_msg, "type", None) or getattr(last_msg, "role", None)
+                        if not content and isinstance(last_msg, (list, tuple)) and len(last_msg) >= 2:
+                            role, content = last_msg[0], last_msg[1]
+                    except Exception:
+                        pass
+                    if content:
+                        Conversations[conv_id]["history"].append({"role": role or "assistant", "content": str(content)})
+                        payload = {"type": "message", "role": role or "assistant", "content": content}
+                        yield f"data: {json.dumps(payload)}\n\n"
+
+            if last_chunk and last_chunk.get("final_trade_decision"):
+                processed = ta.process_signal(last_chunk["final_trade_decision"]) or ""
+                payload = {
+                    "type": "done",
+                    "decision": last_chunk.get("final_trade_decision", ""),
+                    "decision_processed": processed,
+                    "agent": "Risk Manager",
+                }
+                Conversations[conv_id]["history"].append({"role": "assistant", "content": f"Decision: {processed}"})
+                yield f"data: {json.dumps(payload)}\n\n"
+
+            Conversations[conv_id]["phase"] = "completed"
+            yield "event: end\ndata: {}\n\n"
+        except Exception as e:
+            err = {"type": "error", "message": str(e)}
+            yield f"data: {json.dumps(err)}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.post("/api/chat", response_model=ChatResponse)
