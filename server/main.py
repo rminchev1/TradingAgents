@@ -4,9 +4,10 @@ import logging
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from fastapi.responses import StreamingResponse
 import json
+import uuid
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -28,6 +29,18 @@ class AnalyzeResponse(BaseModel):
     decision: str
     decision_processed: str
     reports: Dict[str, Any]
+    conv_id: str
+
+
+class ChatRequest(BaseModel):
+    conv_id: str
+    message: str
+
+
+class ChatResponse(BaseModel):
+    conv_id: str
+    reply: str
+    agent: Optional[str] = None
 
 
 def detect_provider_from_env() -> Optional[str]:
@@ -65,6 +78,8 @@ def build_config(req: AnalyzeRequest) -> Dict[str, Any]:
 
 
 app = FastAPI(title="TradingAgents API", version="0.1.0")
+Conversations: Dict[str, Dict[str, Any]] = {}
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -95,12 +110,25 @@ def analyze(req: AnalyzeRequest):
             "risk_debate_state": final_state.get("risk_debate_state"),
         }
 
+        conv_id = uuid.uuid4().hex
+        Conversations[conv_id] = {
+            "cfg": cfg,
+            "ticker": req.ticker,
+            "date": date,
+            "reports": reports,
+            "history": [
+                {"role": "system", "content": "TradingAgents conversation started."},
+                {"role": "assistant", "content": f"Decision: {processed}"},
+            ],
+        }
+
         return AnalyzeResponse(
             ticker=req.ticker,
             date=date,
             decision=final_state.get("final_trade_decision", ""),
             decision_processed=processed,
             reports=reports,
+            conv_id=conv_id,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -154,11 +182,21 @@ def stream_analyze(ticker: str, date: Optional[str] = None,
 
     init_state = ta.propagator.create_initial_state(ticker, date or "2024-05-10")
     args = ta.propagator.get_graph_args()
+    conv_id = uuid.uuid4().hex
+    Conversations[conv_id] = {
+        "cfg": cfg,
+        "ticker": ticker,
+        "date": init_state["trade_date"],
+        "reports": {},
+        "history": [
+            {"role": "system", "content": "TradingAgents conversation started (stream)."}
+        ],
+    }
 
     def gen():
         try:
             last_vals: Dict[str, Any] = {}
-            yield f"data: {json.dumps({'type': 'start', 'ticker': ticker, 'date': init_state['trade_date']})}\n\n"
+            yield f"data: {json.dumps({'type': 'start', 'ticker': ticker, 'date': init_state['trade_date'], 'conv_id': conv_id})}\n\n"
 
             last_chunk = None
             # Pylance type mismatch is fine at runtime; graph.stream accepts dict state
@@ -187,6 +225,7 @@ def stream_analyze(ticker: str, date: Optional[str] = None,
                     val = chunk.get(key)
                     if val and val != last_vals.get(key):
                         last_vals[key] = val
+                        Conversations[conv_id]["reports"][key] = val
                         payload = {"type": key, "value": val, "agent": agent_for_key.get(key)}
                         yield f"data: {json.dumps(payload)}\n\n"
 
@@ -203,6 +242,7 @@ def stream_analyze(ticker: str, date: Optional[str] = None,
                     except Exception:
                         pass
                     if content:
+                        Conversations[conv_id]["history"].append({"role": role or "assistant", "content": str(content)})
                         payload = {"type": "message", "role": role or "assistant", "content": content}
                         yield f"data: {json.dumps(payload)}\n\n"
 
@@ -214,6 +254,7 @@ def stream_analyze(ticker: str, date: Optional[str] = None,
                     "decision_processed": processed,
                     "agent": "Risk Manager",
                 }
+                Conversations[conv_id]["history"].append({"role": "assistant", "content": f"Decision: {processed}"})
                 yield f"data: {json.dumps(payload)}\n\n"
 
             yield "event: end\ndata: {}\n\n"
@@ -222,3 +263,51 @@ def stream_analyze(ticker: str, date: Optional[str] = None,
             yield f"data: {json.dumps(err)}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+def _build_quick_llm(cfg: Dict[str, Any]):
+    provider = (cfg.get("llm_provider") or "openai").lower()
+    if provider in ("openai", "ollama", "openrouter"):
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(model=cfg["quick_think_llm"], base_url=cfg.get("backend_url"))
+    if provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        return ChatAnthropic(model=cfg["quick_think_llm"], base_url=cfg.get("backend_url"))  # type: ignore
+    if provider == "google":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(model=cfg["quick_think_llm"])
+    raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    conv = Conversations.get(req.conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    cfg = conv["cfg"]
+    llm = _build_quick_llm(cfg)
+
+    # Build context prompt from reports
+    reports = conv.get("reports", {})
+    context_parts: List[str] = []
+    for k in ["market_report", "sentiment_report", "news_report", "fundamentals_report", "investment_plan", "final_trade_decision"]:
+        v = reports.get(k)
+        if v:
+            context_parts.append(f"[{k}]\n{v}\n")
+    context = "\n".join(context_parts) or "No prior reports."
+
+    messages = [
+        ("system", "You are a concise trading research assistant. Use the provided context when answering follow-up questions. If a question is unrelated to the context, say so."),
+        ("system", f"Context for ticker {conv['ticker']} on {conv['date']}:\n{context}"),
+        ("human", req.message),
+    ]
+
+    try:
+        resp = llm.invoke(messages)
+        text = getattr(resp, "content", str(resp))
+        conv["history"].append({"role": "user", "content": req.message})
+        conv["history"].append({"role": "assistant", "content": text})
+        return ChatResponse(conv_id=req.conv_id, reply=text, agent="Assistant")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
